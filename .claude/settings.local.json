@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\arnay\\\\Downloads\\\\diddy\\\\eeg-platform\" -Recurse -Name)",
+      "Bash(Select-Object -First 100)",
+      "Bash(pip show:*)",
+      "Bash(eeg-platform:*)",
+      "Bash(python -m eeg_platform.cli:*)",
+      "Bash(python:*)"
+    ]
+  }
+}

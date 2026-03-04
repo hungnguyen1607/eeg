@@ -1,21 +1,43 @@
-"""Load EEG data from CSV files."""
+# load eeg data from csv files
 
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
+from .validation import (
+    validate_eeg_data,
+    normalize_channel_name,
+    print_validation_report,
+    ValidationResult,
+    STANDARD_10_20_CHANNELS,
+)
 
+
+# custom error for when eeg data cant be loaded
 class EEGLoadError(Exception):
-    """Raised when EEG data cannot be loaded."""
+    pass
 
-# nan = not a number 
-def load_eeg_csv(path: str, sfreq: float | None = None) -> dict:
+
+# main function to load eeg csv files
+# path: path to csv file
+# sfreq: sampling frequency in hz (required if no time column)
+# validate: check if data follows eeg standards
+# strict: reject files with non-standard columns
+# auto_map_channels: rename generic channels like EEG1 to Fp1
+def load_eeg_csv(
+    path: str,
+    sfreq: float | None = None,
+    validate: bool = True,
+    strict: bool = False,
+    auto_map_channels: bool = True,
+) -> dict:
     filepath = Path(path)
     if not filepath.exists():
         raise FileNotFoundError(f"File not found: {filepath}")
 
-    #  loading csv 
+    # load the csv
     try:
         df = pd.read_csv(filepath)
     except pd.errors.EmptyDataError:
@@ -24,7 +46,7 @@ def load_eeg_csv(path: str, sfreq: float | None = None) -> dict:
     if df.empty:
         raise EEGLoadError(f"File contains no data rows: {filepath}")
 
-    # checking for time column
+    # check if theres a time column
     has_time_col = "time" in df.columns.str.lower()
     time_col_name = None
     if has_time_col:
@@ -33,14 +55,15 @@ def load_eeg_csv(path: str, sfreq: float | None = None) -> dict:
                 time_col_name = col
                 break
 
-    
     if time_col_name:
         time_data = pd.to_numeric(df[time_col_name], errors="coerce")
-        if time_data.isna().all():  # take time array and check if all values are NaN
+        # check if all values are nan
+        if time_data.isna().all():
             raise EEGLoadError(f"Time column '{time_col_name}' contains no valid numeric values")
-        time = time_data.to_numpy(dtype=np.float64) # convert time column to numeric coercing errors to nan then to numpy array
+        # convert to numpy array
+        time = time_data.to_numpy(dtype=np.float64)
 
-        # use sfreq from time column if not provided
+        # figure out sample rate from time column if not given
         if sfreq is None:
             if len(time) < 2:
                 raise EEGLoadError("Cannot infer sfreq: need at least 2 time samples")
@@ -51,7 +74,7 @@ def load_eeg_csv(path: str, sfreq: float | None = None) -> dict:
 
         df = df.drop(columns=[time_col_name])
     else:
-        # use sfreq to make time array if no time column was detected
+        # no time column, so we need sfreq to create one
         if sfreq is None:
             raise EEGLoadError(
                 "No 'time' column found and sfreq not provided. "
@@ -60,10 +83,10 @@ def load_eeg_csv(path: str, sfreq: float | None = None) -> dict:
         n_samples = len(df)
         time = np.arange(n_samples, dtype=np.float64) / sfreq
 
-    # convert all columns to numeric, coercing errors to nan 
+    # convert everything to numbers, turn bad values into nan
     df_numeric = df.apply(pd.to_numeric, errors="coerce")
 
-    # Check for numeric columns
+    # find columns that actually have numbers
     numeric_cols = df_numeric.columns[df_numeric.notna().any()].tolist()
     if not numeric_cols:
         raise EEGLoadError(
@@ -73,10 +96,10 @@ def load_eeg_csv(path: str, sfreq: float | None = None) -> dict:
     df_numeric = df_numeric[numeric_cols]
     ch_names = numeric_cols
 
-    # finding nans values
+    # check for too many nan values
     nan_counts = df_numeric.isna().sum()
     total_values = len(df_numeric)
-    nan_threshold = 0.1  # 10% threshold
+    nan_threshold = 0.1  # 10% max
 
     for col in ch_names:
         nan_ratio = nan_counts[col] / total_values
@@ -86,21 +109,51 @@ def load_eeg_csv(path: str, sfreq: float | None = None) -> dict:
                 f"Check for non-numeric data in this column."
             )
 
-    # fill all the nans with 0 
+    # fill remaining nans with 0
     total_nans = df_numeric.isna().sum().sum()
     if total_nans > 0:
         df_numeric = df_numeric.fillna(0.0)
 
-    # convert to numpy array (n_channels, n_samples)
+    # convert to numpy array with shape (n_channels, n_samples)
     data = df_numeric.to_numpy(dtype=np.float64).T
 
     n_channels, n_samples = data.shape
 
-    #  making sure time array length = number of samples
+    # make sure time array matches data length
     if len(time) != n_samples:
         raise EEGLoadError(
             f"Time array length ({len(time)}) does not match data samples ({n_samples})"
-        ) #checking time stamps, making sure its correctly spaced
+        )
+
+    # validate the eeg data if enabled
+    validation_result = None
+    if validate:
+        validation_result = validate_eeg_data(
+            columns=ch_names,
+            n_samples=n_samples,
+            sfreq=sfreq,
+            strict=strict,
+        )
+
+        if not validation_result.is_valid:
+            error_msg = "; ".join(validation_result.errors)
+            raise EEGLoadError(f"Validation failed: {error_msg}")
+
+        # auto rename channels like EEG1 -> Fp1
+        if auto_map_channels and validation_result.channel_mapping:
+            new_ch_names = []
+            valid_indices = []
+
+            for i, ch in enumerate(ch_names):
+                if ch in validation_result.channel_mapping:
+                    new_ch_names.append(validation_result.channel_mapping[ch])
+                    valid_indices.append(i)
+
+            # only keep valid channels
+            if valid_indices:
+                ch_names = new_ch_names
+                data = data[valid_indices, :]
+                n_channels = len(ch_names)
 
     meta = {
         "filepath": str(filepath.resolve()),
@@ -108,10 +161,15 @@ def load_eeg_csv(path: str, sfreq: float | None = None) -> dict:
         "n_samples": n_samples,
     }
 
-    return {
+    result = {
         "data": data,
         "ch_names": ch_names,
         "time": time,
         "sfreq": float(sfreq),
         "meta": meta,
     }
+
+    if validation_result:
+        result["validation"] = validation_result
+
+    return result
